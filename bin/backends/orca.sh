@@ -131,7 +131,15 @@ fm_backend_orca_repo_ensure() {  # <project-path>
 fm_backend_orca_worktree_create() {  # <project-path> <name>
   local project=$1 name=$2 repo_id out wt_id wt_path terminal
   repo_id=$(fm_backend_orca_repo_ensure "$project") || return 1
-  out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) || return 1
+  # Nest the task worktree under the project's main checkout so Orca lists the
+  # crew as child rows of that project, the way a Herdr space groups its task
+  # tabs. Worktree ids are <repo-id>::<path>, so the main checkout's id needs
+  # no extra lookup. A host that rejects the parent selector gets one retry as
+  # an independent worktree rather than a refused spawn.
+  out=$(orca worktree create --repo "id:$repo_id" --name "$name" --parent-worktree "worktree:${repo_id}::${project}" --setup skip --json 2>/dev/null) \
+    && printf '%s' "$out" | fm_backend_orca_json_get worktree-id >/dev/null 2>&1 \
+    || out=$(orca worktree create --repo "id:$repo_id" --name "$name" --no-parent --setup skip --json) \
+    || return 1
   wt_id=$(printf '%s' "$out" | fm_backend_orca_json_get worktree-id) || {
     echo "error: orca worktree create did not return a worktree id for $name" >&2
     return 1

@@ -466,11 +466,29 @@ test_worktree_and_terminal_helpers_parse_json() {
     "worktree helper should first check repo registration"
   assert_contains "$(cat "$LOG")" $'orca\x1f''repo'$'\x1f''add'$'\x1f''--path'$'\x1f''/repo/path'$'\x1f''--json' \
     "worktree helper should register an absent repo"
-  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''create'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--name'$'\x1f''fm-task'$'\x1f''--no-parent'$'\x1f''--setup'$'\x1f''skip'$'\x1f''--json' \
-    "worktree helper did not create an independent no-hook worktree"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''create'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--name'$'\x1f''fm-task'$'\x1f''--parent-worktree'$'\x1f''worktree:repo-123::/repo/path'$'\x1f''--setup'$'\x1f''skip'$'\x1f''--json' \
+    "worktree helper did not create a no-hook worktree nested under the project's main checkout"
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''create'$'\x1f''--worktree'$'\x1f''id:wt-123::/orca/wt-123'$'\x1f''--title'$'\x1f''fm-task'$'\x1f''--json' \
     "terminal helper did not create a titled terminal for the worktree"
   pass "Orca lifecycle helpers: register repo, create worktree, create terminal, parse stable ids"
+}
+
+test_worktree_create_falls_back_to_no_parent() {
+  local out wt_id
+  orca_case lifecycle-parent-fallback
+  printf '{"ok":true,"result":{"repo":{"id":"repo-123"}}}\n' > "$RESP/1.out"
+  printf '{"ok":false,"error":{"code":"selector_not_found","message":"no worktree matches worktree:repo-123::/repo/path"}}\n' > "$RESP/2.out"
+  printf '1\n' > "$RESP/2.exit"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-flat::/orca/wt-flat","path":"/tmp/orca-wt-flat"}}}\n' > "$RESP/3.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_worktree_create /repo/path fm-task' "$ROOT" 2>/dev/null )
+  wt_id=${out%%$'\t'*}
+  [ "$wt_id" = wt-flat::/orca/wt-flat ] || fail "worktree helper should print the fallback worktree id, got '$out'"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''create'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--name'$'\x1f''fm-task'$'\x1f''--parent-worktree'$'\x1f''worktree:repo-123::/repo/path'$'\x1f''--setup'$'\x1f''skip'$'\x1f''--json' \
+    "worktree helper should first try the nested create"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''create'$'\x1f''--repo'$'\x1f''id:repo-123'$'\x1f''--name'$'\x1f''fm-task'$'\x1f''--no-parent'$'\x1f''--setup'$'\x1f''skip'$'\x1f''--json' \
+    "worktree helper should retry as an independent worktree when the parent selector is refused"
+  pass "fm_backend_orca_worktree_create: falls back to --no-parent when the parent selector is refused"
 }
 
 test_worktree_create_removes_worktree_when_path_missing() {
@@ -1375,6 +1393,7 @@ test_worktree_path_resolves_id
 test_dispatcher_sources_orca_and_routes_primitives
 test_json_get_ignores_undocumented_terminal_id_shapes
 test_worktree_and_terminal_helpers_parse_json
+test_worktree_create_falls_back_to_no_parent
 test_worktree_create_removes_worktree_when_path_missing
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness

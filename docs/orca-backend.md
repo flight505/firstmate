@@ -46,7 +46,8 @@ Orca returns `orca_worktree_id=` as that composite of the Orca repo id and the w
 
 ## Current lifecycle and safety
 
-Spawn registers the repository, creates an independent worktree, reuses only the verified `result.terminal.handle` returned by Orca or creates a terminal explicitly, installs harness hooks, records metadata, and launches the selected harness.
+Spawn registers the repository, creates a worktree nested under the project's main checkout (`--parent-worktree worktree:<repo-id>::<project-path>`, retried once with `--no-parent` if Orca refuses that selector), reuses only the verified `result.terminal.handle` returned by Orca or creates a terminal explicitly, installs harness hooks, records metadata, and launches the selected harness.
+Nesting makes Orca list every crewmate as a child row of its project, the way a Herdr space groups its task tabs.
 Exact command flags and response parsing are owned by `bin/backends/orca.sh` and script help.
 
 `fm-peek.sh` reads with `orca terminal read`.
