@@ -1,0 +1,5 @@
+ok - orca 1.4.218: the command schema lists the native wait and agent-row commands the adapter uses
+ok - orca 1.4.218: worktree ps answers in the verified envelope and all 5 live agent rows carry the verified fields
+ok - orca 1.4.218: not running inside an Orca terminal, so terminal show was not checked
+ok - orca 1.4.218: a terminal that does not exist reads unknown, and its tui-idle wait is an unusable read rather than idle
+# fm-backend-orca-smoke.test.sh: all assertions passed
