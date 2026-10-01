@@ -898,6 +898,7 @@ test_agent_state_classifies_connected_and_identity() {
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_agent_state term-dead' "$ROOT" )
   [ "$out" = dead ] || fail "connected=false should classify as dead, got '$out'"
+  cp "$RESP/1.out" "$RESP/2.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_agent_alive term-dead' "$ROOT" )
   [ "$out" = dead ] || fail "the compatibility view should keep connected=false dead, got '$out'"
@@ -929,6 +930,7 @@ test_agent_state_missing_falls_back_to_runtime_readiness() {
   [ "$out" = missing ] || fail "a not-found terminal with a ready runtime should classify as missing, got '$out'"
   assert_contains "$(cat "$LOG")" $'orca\x1f''status'$'\x1f''--json' \
     "a failed terminal read should fall back to an Orca runtime readiness check"
+  cp "$RESP/1.out" "$RESP/2.out"
   out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
     bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_agent_alive term-gone' "$ROOT" )
   [ "$out" = dead ] || fail "the compatibility view should treat an authoritatively missing target as dead, got '$out'"
@@ -963,6 +965,24 @@ test_agent_state_unreadable_when_runtime_also_unready() {
   [ "$out" = unknown ] || fail "the compatibility view should keep an unreadable target unknown, got '$out'"
 
   pass "fm_backend_orca_agent_state: a failed read against an unready runtime stays unreadable"
+}
+
+test_agent_state_unproven_read_is_unreadable() {
+  local out
+
+  orca_case agent-state-no-connected
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-odd","agentIdentity":"claude"}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_agent_state term-odd' "$ROOT" )
+  [ "$out" = unreadable ] || fail "a successful read without connected should classify as unreadable, got '$out'"
+
+  orca_case agent-state-bad-json
+  printf 'not json at all\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_agent_state term-odd' "$ROOT" )
+  [ "$out" = unreadable ] || fail "unparseable terminal show JSON should classify as unreadable, got '$out'"
+
+  pass "fm_backend_orca_agent_state: a read without connected, or unparseable, is unreadable even with a ready runtime"
 }
 
 test_agent_state_dispatcher_routes_orca() {
@@ -1692,6 +1712,7 @@ test_target_exists_rejects_orca_error_json
 test_agent_state_classifies_connected_and_identity
 test_agent_state_missing_falls_back_to_runtime_readiness
 test_agent_state_unreadable_when_runtime_also_unready
+test_agent_state_unproven_read_is_unreadable
 test_agent_state_dispatcher_routes_orca
 test_sweep_respawns_dead_orca_secondmate
 test_sweep_respawns_missing_orca_secondmate

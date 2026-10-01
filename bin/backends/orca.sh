@@ -264,13 +264,15 @@ process.stdout.write("identity=" + (typeof identity === "string" ? identity : ""
 # inside an open terminal, which is why bin/fm-control-lib.sh's
 # fm_control_backend_state_verified keeps exit/relaunch refused on Orca.
 #
-# A read that fails outright, returns `ok: false`, or omits `connected` cannot
-# by itself tell "the terminal is gone" apart from "Orca could not be asked
-# right now", so it falls back to the same two-source pattern
+# A read that is refused outright (command failure or `ok: false`) cannot by
+# itself tell "the terminal is gone" apart from "Orca could not be asked right
+# now", so it falls back to the same two-source pattern
 # fm_backend_herdr_agent_state uses for its own failed pane read: a separately
-# confirmed ready Orca runtime means the failed read is authoritative
-# absence (`missing`), while an unreachable runtime means nothing was proven
-# either way (`unreadable`).
+# confirmed ready Orca runtime means the refusal is authoritative absence
+# (`missing`), while an unreachable runtime means nothing was proven either way
+# (`unreadable`). A successful read that omits or garbles `connected`, and
+# unparseable JSON, prove nothing about the terminal and are always
+# `unreadable`, never `missing`.
 fm_backend_orca_agent_state() {  # <terminal-id>
   local terminal=$1 fields status connected identity
   fm_backend_orca_tool_check || { printf 'unreadable'; return 0; }
@@ -293,8 +295,10 @@ fm_backend_orca_agent_state() {  # <terminal-id>
         return 0
         ;;
     esac
+    printf 'unreadable'
+    return 0
   fi
-  if fm_backend_orca_runtime_check >/dev/null 2>&1; then
+  if [ "$status" -eq 2 ] && fm_backend_orca_runtime_check >/dev/null 2>&1; then
     printf 'missing'
   else
     printf 'unreadable'
