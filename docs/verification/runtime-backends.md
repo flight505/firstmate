@@ -297,7 +297,8 @@ Both recorded runtime identities now classify the exact `pi-launcher` foreground
 Backend applicability was reviewed across every spawn adapter.
 Tmux needs the exact `pi-launcher`, `pi-signed`, `pi`, and `Pi` process identities for recovery-grade liveness.
 Herdr uses native registered-agent state and needs no process-name branch.
-Zellij has no verified recovery-grade agent process probe, while Orca and cmux do not support secondmate spawns, so those three retain their existing generic ordinary-launch semantics without a new liveness matcher.
+Orca classifies from its own `connected` and `agentIdentity` terminal fields ([Orca agent state](#orca-agent-state)) and needs no process-name branch.
+Zellij has no verified recovery-grade agent process probe, and cmux does not support secondmate spawns, so those two retain their existing generic ordinary-launch semantics without a new liveness matcher.
 
 The current classifier matrix and its refresh guard are recorded in [Composer classification matrix](#composer-classification-matrix), with portable shape coverage in `tests/fm-composer-lib.test.sh` and `tests/fm-composer-ghost.test.sh`.
 Kimi pointer delivery and OpenCode 1.18.4 busy-queue behavior remain pinned by `tests/fm-kimi-harness.test.sh`, `tests/fm-tmux-submit-busy.test.sh`, and `tests/fm-composer-lib.test.sh`.
@@ -1868,6 +1869,59 @@ tests/fm-bootstrap.test.sh
 ```
 
 The fake-Orca suite covers readiness, registration, create response parsing, metadata routing, popup-safe submit, and path-matched release refusal.
+
+### Orca agent state
+
+Verified on 2026-10-01 with Orca app and CLI 1.4.218 on macOS, against one disposable terminal and the classifier's own read:
+
+```sh
+orca terminal show --terminal <handle> --json
+```
+
+Observed `result.terminal` fields, with `connected` always a boolean and `agentIdentity` a string or absent:
+
+| Terminal condition | `connected` | `agentIdentity` | Other |
+| --- | --- | --- | --- |
+| Bare shell, no agent started | `true` | absent | |
+| Claude Code 2.1.286 running | `true` | `"claude"` | |
+| Claude Code exited with `/exit`, shell remains | `true` | absent within 1 second, still absent after 60 seconds | |
+| Codex 0.158.0 running at its folder-trust dialog, 25 seconds | `true` | absent | `agentWait.reason="agent-trust-workspace"` |
+| Terminal closed with `orca terminal close` | `false` | absent | `orphaned=true`, `exitCause.kind="operator_close"` |
+
+A handle Orca does not know exits 1 with this body, while `orca status --json` still reports `result.runtime.state="ready"`:
+
+```text
+{"ok": false, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}}
+```
+
+These readings bound what `fm_backend_orca_agent_state` can claim.
+`connected=false` and a stale handle against a ready runtime are authoritative, so `dead` and `missing` are sound.
+`connected=true` is the same for a bare shell, an exited agent, and a running agent, and an absent `agentIdentity` is the same for a bare shell and a running Codex, so neither field proves that an agent stopped inside an open terminal.
+That is why `bin/fm-control.sh <id> exit` and `relaunch` stay refused on Orca.
+`tests/fm-backend-orca.test.sh` pins the classifier against these response shapes with a fake CLI.
+
+### Orca key delivery
+
+Verified on 2026-10-01 with Orca 1.4.218 by sending the bytes `fm_backend_orca_send_key` sends to `cat -v` in a disposable terminal, then reading the terminal back:
+
+```sh
+orca terminal send --terminal <handle> --text "$(printf '\033')" --json
+orca terminal send --terminal <handle> --text "abc" --json
+orca terminal send --terminal <handle> --text "$(printf '\025')" --json
+orca terminal send --terminal <handle> --text "xyz" --enter --json
+orca terminal send --terminal <handle> --interrupt --json
+```
+
+```text
+^[
+^[
+xyz
+xyz
+^C
+```
+
+The raw ESC byte reached the process as Escape, the raw Ctrl-U byte performed the terminal line kill that removed `abc`, and `--interrupt` arrived as Ctrl-C.
+Against live agents, one Escape left a running Claude Code 2.1.286 running with `agentIdentity="claude"`, and one Escape dismissed the Codex 0.158.0 folder-trust dialog through its `esc quit` binding.
 
 ## cmux
 

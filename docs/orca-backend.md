@@ -7,7 +7,7 @@ Firstmate agents load [`firstmate-orca`](../.agents/skills/firstmate-orca/SKILL.
 ## Setup
 
 Pick Orca when you already use the Orca macOS app and want Orca-managed worktrees and terminals instead of Treehouse plus a session multiplexer.
-Orca is macOS-only, explicit-only, and does not support secondmate spawns.
+Orca is macOS-only and explicit-only.
 
 Prerequisites:
 
@@ -24,7 +24,7 @@ No manual repository registration is required.
 
 Open the Orca app to watch a task's terminal.
 Routine supervision uses the recorded endpoint through `bin/fm-peek.sh <id>` and `FM_HOME=<home> bin/fm-send.sh <id> '<text>'`.
-Enter and Ctrl-C are supported; Escape is not.
+Enter, Ctrl-C, Escape, and Ctrl-U are supported.
 
 ## Task shape and metadata
 
@@ -68,12 +68,25 @@ It never raw-deletes an Orca worktree.
 A close the CLI never attempted, because `orca` is not on the path, stops cleanup with the metadata intact even under `--force`: removing those records would leave nothing on disk naming a terminal that may still be live.
 Reinstall the CLI and rerun; [`verification/runtime-backends.md`](verification/runtime-backends.md) "Endpoint close" owns what this arm can and cannot prove about its own close.
 
+## Recovery
+
+`orca terminal show --terminal <handle> --json` reports the terminal's own `connected` and `agentIdentity` fields, and the classifier in `bin/backends/orca.sh` (`fm_backend_orca_agent_state`) reads those rather than scraping the composer.
+`connected=true` is `alive`, downgraded to `ambiguous` when Orca reports an `agentIdentity` that the shared harness-process vocabulary (`bin/fm-agent-process-lib.sh`) does not recognize as a verified agent.
+`connected=false` is `dead`.
+A failed or unparseable read falls back to `orca status --json`: a ready runtime means the terminal is authoritatively gone (`missing`), while an unreachable runtime proves nothing either way (`unreadable`).
+Only `dead` and `missing` license unattended recovery, and both mean the terminal itself is closed or gone, so a secondmate spawn on this backend cannot be relaunched into a terminal that still holds an agent.
+
+`connected` is the terminal's liveness, not the agent's.
+A terminal whose agent exited back to its shell still reads `connected=true`, so it classifies `alive` and is not auto-recovered.
+`agentIdentity` does not close that gap: Orca omits it for a bare shell and also for some running agents.
+[`verification/runtime-backends.md`](verification/runtime-backends.md#orca-agent-state) owns the live evidence for both readings.
+Because neither field can prove that an agent stopped while its terminal stays open, `bin/fm-control.sh <id> exit` and `relaunch` refuse on Orca ([`agent-control.md`](agent-control.md)).
+
 ## Active limits
 
 - Orca is macOS-only and explicit-only.
 - The app must be running and report ready.
-- Secondmate spawns are unsupported.
-- Escape is unsupported.
+- `bin/fm-control.sh <id> exit` and `relaunch` are refused, and a secondmate whose agent exited inside an open terminal is not auto-recovered; see [Recovery](#recovery).
 - Orca exposes no stable CLI version or protocol marker, so readiness is the compatibility gate rather than a version floor.
 - Only the verified terminal-handle and worktree result fields are accepted; speculative response shapes are rejected.
 - Orca's worktree shape is unverified against the spawn-time Claude workspace-trust check in `bin/fm-claude-trust.sh`, which refuses any path that is not a linked git worktree sharing the project's git common dir, so a claude spawn on Orca fails loudly at that check rather than launching if Orca clones instead of linking.

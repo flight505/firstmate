@@ -493,20 +493,21 @@ test_unverified_harness_is_refused() {
 
 test_backend_key_capability_matrix() {
   local backend key
-  for backend in tmux herdr zellij cmux; do
-    # C-u is the composer clear muse's interrupt needs; every session provider
-    # but Orca normalizes it (bin/backends/*.sh).
+  # C-u is the composer clear muse's interrupt needs. Every session provider
+  # normalizes all four keys, and Orca sends Escape and Ctrl+U as raw --text
+  # control bytes (bin/backends/orca.sh).
+  for backend in tmux herdr zellij cmux orca; do
     for key in Escape Enter C-c C-u; do
       fm_control_backend_supports_key "$backend" "$key" \
         || fail "$backend should be able to deliver $key"
     done
   done
-  fm_control_backend_supports_key orca Escape \
-    && fail "orca's terminal API has no Escape and must not claim it"
-  fm_control_backend_supports_key orca C-u \
-    && fail "orca's terminal API has no composer clear and must not claim one"
-  fm_control_backend_supports_key orca C-c || fail "orca should deliver C-c"
-  fm_control_backend_supports_key orca Enter || fail "orca should deliver Enter"
+  fm_control_backend_supports_key orca F13 \
+    && fail "orca must not claim a key it has no send-key mapping for"
+  for key in Escape Enter C-c C-u; do
+    fm_control_backend_supports_key someunknownbackend "$key" \
+      && fail "an unrecognized backend must not claim it can deliver $key"
+  done
   pass "fm-control-lib: the backend key matrix matches each adapter's real send-key surface"
 }
 
@@ -534,7 +535,7 @@ test_harness_kind_capability() {
   pass "fm-control-lib: adapter capability is per task kind, not per adapter alone"
 }
 
-test_orca_refuses_an_escape_harness_interrupt() {
+test_orca_interrupt_delivers_a_real_escape() {
   local dir out rc
   dir=$(new_case orca-escape)
   add_task "$dir" t1 claude ship orca "term-1"
@@ -545,15 +546,38 @@ test_orca_refuses_an_escape_harness_interrupt() {
     echo "orca_worktree_id=wt-1::/orca/wt-1"
   } > "$dir/home/state/t1.meta.new"
   sed 's|^window=.*|window=fm-t1|' "$dir/home/state/t1.meta.new" > "$dir/home/state/t1.meta"
+  # The fake Orca terminal reads alive (connected=true) and records every send,
+  # one argument per line, so the delivered key bytes can be asserted.
+  cat > "$dir/fakebin/orca" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = terminal ] && [ "${2:-}" = send ]; then
+  printf '%s\n' "$@" >> "$FM_FAKE_DIR/orca-send"
+  printf '{"ok":true,"result":{}}\n'
+  exit 0
+fi
+if [ "${1:-}" = terminal ] && [ "${2:-}" = show ]; then
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-1","connected":true,"agentIdentity":"claude"}}}\n'
+  exit 0
+fi
+if [ "${1:-}" = terminal ] && [ "${2:-}" = read ]; then
+  printf '{"ok":true,"result":{"terminal":{"tail":["working"]}}}\n'
+  exit 0
+fi
+printf '{"ok":true,"result":{"runtime":{"state":"ready","reachable":true}}}\n'
+SH
+  chmod +x "$dir/fakebin/orca"
   out=$(run_control "$dir" t1 interrupt); rc=$?
-  expect_code 1 "$rc" "an Escape harness on orca should refuse"
-  assert_contains "$out" "cannot deliver" "refusal should name the undeliverable key"
-  pass "fm-control interrupt: a backend that cannot deliver the harness's key refuses instead of sending another"
+  expect_code 0 "$rc" "an Escape harness on orca should be interrupted"$'\n'"$out"
+  grep -qx $'\x1b' "$dir/fake/orca-send" \
+    || fail "the orca interrupt should send a raw ESC byte as --text"$'\n'"$(cat -v "$dir/fake/orca-send" 2>/dev/null)"
+  grep -qx -- '--interrupt' "$dir/fake/orca-send" \
+    && fail "an Escape interrupt must not be sent as orca's Ctrl-C --interrupt"
+  pass "fm-control interrupt: orca delivers the harness's Escape key as a raw control byte"
 }
 
 test_unverified_state_backends_refuse_stop_verbs() {
   local dir out rc backend
-  for backend in zellij cmux; do
+  for backend in zellij cmux orca; do
     dir=$(new_case "nostate-$backend")
     if [ "$backend" = zellij ]; then
       add_task "$dir" t1 claude ship zellij "sess:7"
@@ -562,6 +586,25 @@ test_unverified_state_backends_refuse_stop_verbs() {
         echo "zellij_tab_id=1"
         echo "zellij_pane_id=7"
       } >> "$dir/home/state/t1.meta"
+    elif [ "$backend" = orca ]; then
+      # Orca has a classifier, but its `alive` proves only an open terminal, so
+      # it is refused on the same gate. The fake terminal reads alive and
+      # records every send so a leaked exit command would be seen.
+      add_task "$dir" t1 claude ship orca "term-1"
+      {
+        cat "$dir/home/state/t1.meta"
+        echo "terminal=term-1"
+        echo "orca_worktree_id=wt-1::/orca/wt-1"
+      } > "$dir/home/state/t1.meta.new"
+      sed 's|^window=.*|window=fm-t1|' "$dir/home/state/t1.meta.new" > "$dir/home/state/t1.meta"
+      cat > "$dir/fakebin/orca" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = terminal ] && [ "${2:-}" = send ]; then
+  printf '%s\n' "$@" >> "$FM_FAKE_DIR/literal"
+fi
+printf '{"ok":true,"result":{"terminal":{"handle":"term-1","connected":true,"agentIdentity":"claude"}}}\n'
+SH
+      chmod +x "$dir/fakebin/orca"
     else
       add_task "$dir" t1 claude ship cmux "ws1:surface1"
       {
@@ -588,7 +631,7 @@ test_state_verified_backends_are_exactly_tmux_and_herdr() {
   local backend
   for backend in zellij orca cmux; do
     fm_control_backend_state_verified "$backend" \
-      && fail "$backend has no recovery-grade classifier and must not claim one"
+      && fail "$backend cannot prove an agent stopped and must not claim it can"
   done
   pass "fm-control-lib: stop-proving verbs are gated on the backends that really classify agent state"
 }
@@ -1082,7 +1125,7 @@ test_relaunch_resume_flag_is_per_adapter_and_reference_owner
 test_prefixed_recorded_harness_reaches_each_control_verb
 test_backend_key_capability_matrix
 test_harness_kind_capability
-test_orca_refuses_an_escape_harness_interrupt
+test_orca_interrupt_delivers_a_real_escape
 test_unverified_state_backends_refuse_stop_verbs
 test_state_verified_backends_are_exactly_tmux_and_herdr
 test_window_label_is_refused_with_the_exact_id
