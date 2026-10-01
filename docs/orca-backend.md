@@ -73,7 +73,8 @@ Reinstall the CLI and rerun; [`verification/runtime-backends.md`](verification/r
 `orca terminal show --terminal <handle> --json` reports the terminal's own `connected` and `agentIdentity` fields, and the classifier in `bin/backends/orca.sh` (`fm_backend_orca_agent_state`) reads those rather than scraping the composer.
 `connected=true` is `alive`, downgraded to `ambiguous` when Orca reports an `agentIdentity` that the shared harness-process vocabulary (`bin/fm-agent-process-lib.sh`) does not recognize as a verified agent.
 `connected=false` is `dead`.
-A failed or unparseable read falls back to `orca status --json`: a ready runtime means the terminal is authoritatively gone (`missing`), while an unreachable runtime proves nothing either way (`unreadable`).
+A refused read (command failure or `ok: false`) falls back to `orca status --json`: a ready runtime means the terminal is authoritatively gone (`missing`), while an unreachable runtime proves nothing either way (`unreadable`).
+A successful read whose `connected` is absent or not a boolean, and unparseable output, prove nothing and are always `unreadable`.
 Only `dead` and `missing` license unattended recovery, and both mean the terminal itself is closed or gone, so a secondmate spawn on this backend cannot be relaunched into a terminal that still holds an agent.
 
 `connected` is the terminal's liveness, not the agent's.
