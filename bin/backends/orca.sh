@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # bin/backends/orca.sh - the Orca terminal session-provider adapter.
 #
-# Orca owns both the task worktree and the terminal endpoint. Escape key support
-# remains unsupported until Orca exposes a terminal-send primitive for it.
+# Orca owns both the task worktree and the terminal endpoint. Escape and Ctrl-U
+# are delivered as their raw --text control bytes; see fm_backend_orca_send_key.
 #
 # Target string shape: the Orca terminal id accepted by `orca terminal ...`.
 
@@ -11,6 +11,13 @@
 # every backend so the decision cannot drift.
 # shellcheck source=bin/fm-composer-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/../fm-composer-lib.sh"
+
+# Shared, backend-neutral harness-process identity (bin/fm-agent-process-lib.sh):
+# reused here to judge Orca's own reported `agentIdentity` string against the
+# same verified-harness vocabulary every other backend uses, so "claude",
+# "codex", etc. cannot drift into a second identity list.
+# shellcheck source=bin/fm-agent-process-lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../fm-agent-process-lib.sh"
 
 fm_backend_orca_tool_check() {
   command -v orca >/dev/null 2>&1 || { echo "error: backend=orca selected but the 'orca' CLI is not installed" >&2; return 1; }
@@ -204,6 +211,110 @@ fm_backend_orca_worktree_path() {
   printf '%s' "$path"
 }
 
+# fm_backend_orca_terminal_show_fields: read `orca terminal show`'s own
+# `connected` and `agentIdentity` fields for <terminal-id>, one per output
+# line as `connected=<true|false|unknown>` and `identity=<value-or-empty>`.
+# Exit 0 only for a successful, parseable read; exit 2 for a command failure
+# or an `ok: false` response (the terminal handle did not resolve, or some
+# other request-level error); exit 1 for unparseable JSON. The caller
+# (fm_backend_orca_agent_state) does not need to tell those failure shapes
+# apart itself - both mean "this read did not prove anything either way".
+fm_backend_orca_terminal_show_fields() {  # <terminal-id>
+  local terminal=$1 out
+  out=$(orca terminal show --terminal "$terminal" --json 2>/dev/null) || return 2
+  printf '%s' "$out" | node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (err) {
+  process.exit(1);
+}
+if (data.ok === false) process.exit(2);
+const r = data.result || {};
+const term = r.terminal || r;
+const connected = term.connected;
+const identity = term.agentIdentity;
+const connStr = (typeof connected === "boolean") ? String(connected) : "unknown";
+process.stdout.write("connected=" + connStr + "\n");
+process.stdout.write("identity=" + (typeof identity === "string" ? identity : "") + "\n");
+'
+}
+
+# fm_backend_orca_agent_state: recovery-grade harness-agent state for one
+# recorded Orca terminal handle. See bin/fm-backend.sh's fm_backend_agent_state
+# for the shared state vocabulary. Built directly on `orca terminal show`'s own
+# `connected` and `agentIdentity` fields (docs/orca-backend.md "Recovery")
+# rather than text-scraping the composer, the same way the herdr adapter
+# cross-checks its own native pane/process fields instead of guessing from
+# rendered output.
+#
+# `connected=true` is `alive`, downgraded to `ambiguous` when Orca reports an
+# `agentIdentity` that the shared fm_agent_process_classify_name vocabulary
+# does not recognize as an agent. An absent identity does not downgrade the
+# verdict, because Orca omits it for some running agents as well as for a bare
+# shell (docs/verification/runtime-backends.md "Orca agent state").
+# `connected=false` is `dead`: the terminal handle still resolves but its
+# terminal is closed, so nothing can be running in it.
+#
+# `connected` is the TERMINAL's liveness, not the agent's: an agent that exited
+# back to its shell still reads `connected=true`, and so `alive`. This
+# classifier therefore never reports a false `dead` or `missing` - the only
+# verdicts that license recovery - but it cannot prove that an agent stopped
+# inside an open terminal, which is why bin/fm-control-lib.sh's
+# fm_control_backend_state_verified keeps exit/relaunch refused on Orca.
+#
+# A read that is refused outright (command failure or `ok: false`) cannot by
+# itself tell "the terminal is gone" apart from "Orca could not be asked right
+# now", so it falls back to the same two-source pattern
+# fm_backend_herdr_agent_state uses for its own failed pane read: a separately
+# confirmed ready Orca runtime means the refusal is authoritative absence
+# (`missing`), while an unreachable runtime means nothing was proven either way
+# (`unreadable`). A successful read that omits or garbles `connected`, and
+# unparseable JSON, prove nothing about the terminal and are always
+# `unreadable`, never `missing`.
+fm_backend_orca_agent_state() {  # <terminal-id>
+  local terminal=$1 fields status connected identity
+  fm_backend_orca_tool_check || { printf 'unreadable'; return 0; }
+  fields=$(fm_backend_orca_terminal_show_fields "$terminal")
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    connected=$(printf '%s\n' "$fields" | sed -n 's/^connected=//p')
+    identity=$(printf '%s\n' "$fields" | sed -n 's/^identity=//p')
+    case "$connected" in
+      true)
+        if [ -n "$identity" ] && [ "$(fm_agent_process_classify_name "$identity")" != agent ]; then
+          printf 'ambiguous'
+        else
+          printf 'alive'
+        fi
+        return 0
+        ;;
+      false)
+        printf 'dead'
+        return 0
+        ;;
+    esac
+    printf 'unreadable'
+    return 0
+  fi
+  if [ "$status" -eq 2 ] && fm_backend_orca_runtime_check >/dev/null 2>&1; then
+    printf 'missing'
+  else
+    printf 'unreadable'
+  fi
+}
+
+# Backward-compatible three-state view for callers that only need a yes/no
+# agent verdict. The detailed state contract is owned by fm_backend_agent_state.
+fm_backend_orca_agent_alive() {  # <terminal-id>
+  case "$(fm_backend_orca_agent_state "$1")" in
+    alive) printf 'alive' ;;
+    dead|missing) printf 'dead' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 fm_backend_orca_capture() {  # <terminal-id> <lines>
   local terminal=$1 lines=${2:-40} out
   fm_backend_orca_tool_check || return 1
@@ -261,6 +372,13 @@ fm_backend_orca_composer_state() {  # <terminal-id> [expected-label] -> empty|pe
   printf '%s' "$verdict"
 }
 
+# fm_backend_orca_send_key: one named special key.
+# C-c uses Orca's dedicated --interrupt (SIGINT-style) primitive. Enter is an
+# empty --enter send. Escape and C-u are delivered as their raw control bytes
+# through --text, which passes bytes straight to the PTY.
+# This matters because --interrupt is NOT a substitute for Escape: every
+# harness except grok cancels a turn with Escape, not Ctrl-C (bin/fm-control-lib.sh),
+# so aliasing them would mis-fire (e.g. exit Claude instead of interrupting it).
 fm_backend_orca_send_key() {  # <terminal-id> <key>
   local terminal=$1 key=$2
   fm_backend_orca_tool_check || return 1
@@ -270,6 +388,12 @@ fm_backend_orca_send_key() {  # <terminal-id> <key>
       ;;
     Enter|enter)
       fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "" --enter --json
+      ;;
+    Escape|escape|Esc|esc)
+      fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$(printf '\033')" --json
+      ;;
+    C-u|ctrl+u|Ctrl-u|Ctrl-U)
+      fm_backend_orca_run_json orca terminal send --terminal "$terminal" --text "$(printf '\025')" --json
       ;;
     *)
       echo "error: unsupported Orca key '$key'" >&2
