@@ -523,6 +523,8 @@ test_backend_source_shell_portable() {
     mkdir -p "$stub/backends"
     printf 'command -v dirname > "%s"\n' "$probe" > "$stub/backends/orca.sh"
     : > "$stub/fm-composer-lib.sh"
+    : > "$stub/fm-transition-lib.sh"
+    : > "$stub/fm-agent-process-lib.sh"
     zsh -c "cd '$ROOT' && source bin/fm-backend.sh && FM_BACKEND_LIB_DIR='$stub' && fm_backend_source orca" >/dev/null 2>&1 \
       || fail "zsh: fm_backend_source orca should load a stub adapter"
     [ -s "$probe" ] \

@@ -34,7 +34,8 @@ sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
     "$STATE_DIR"/.wake-queue.seq "$STATE_DIR"/.watch-triage.log \
-    "$STATE_DIR"/.herdr-escalated-* "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
+    "$STATE_DIR"/.herdr-escalated-* "$STATE_DIR"/.orca-escalated-* \
+    "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled "$TMP"/session 2>/dev/null || true
   : > "$WAKE_LOG"
   : > "$SLEEP_LOG"
   _event_cap_key=""
@@ -94,6 +95,48 @@ fi
 [ ! -s "$WAKE_LOG" ] || fail "a captain-held crew must not wake the supervisor from the event fast-path"
 grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the captain-held absorb should be logged to the triage log"
 pass "handle_push_transition: a captain-held crew is absorbed (no fast wake), left to the poll loop's long cadence"
+
+# --- handle_push_transition: an Orca record names its terminal handle ---------
+
+reset_state
+fm_write_meta "$STATE_DIR/tko.meta" "window=fm-tko" "terminal=term_a1" "backend=orca" "kind=ship"
+handle_push_transition orca orca "$(fm_transition_record term_a1 "" "" blocked "")"
+grep -q 'stale' "$STATE_DIR/.wake-queue" 2>/dev/null || fail "handle_push_transition should enqueue a stale wake for a blocked Orca crew"
+grep -q 'term_a1 (orca: agent blocked' "$STATE_DIR/.wake-queue" \
+  || fail "the stale record must name the Orca terminal and the orca-blocked cause: $(cat "$STATE_DIR/.wake-queue")"
+[ -s "$WAKE_LOG" ] || fail "handle_push_transition must wake the supervisor for a blocked Orca crew"
+[ -e "$STATE_DIR/.orca-escalated-term_a1" ] || fail "handle_push_transition must commit the Orca dedupe marker after enqueue"
+pass "handle_push_transition: a blocked Orca crew enqueues a stale wake naming its terminal and commits its dedupe marker"
+
+reset_state
+fm_write_meta "$STATE_DIR/tko.meta" "window=fm-tko" "terminal=term_a1" "backend=orca" "kind=ship"
+printf 'paused: waiting on the upstream release\n' > "$STATE_DIR/tko.status"
+handle_push_transition orca orca "$(fm_transition_record term_a1 "" "" blocked "")"
+if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
+  fail "a declared-pause Orca crew must NOT be fast-escalated: $(cat "$STATE_DIR/.wake-queue")"
+fi
+[ ! -s "$WAKE_LOG" ] || fail "a declared-pause Orca crew must not wake the supervisor from the event fast-path"
+pass "handle_push_transition: a declared-pause Orca crew is resolved by its terminal handle and absorbed"
+
+# --- event_wait_or_sleep: every Orca terminal shares one bounded wait ---------
+
+reset_state
+fm_write_meta "$STATE_DIR/tko1.meta" "window=fm-tko1" "terminal=term_a1" "backend=orca" "kind=ship"
+fm_write_meta "$STATE_DIR/tko2.meta" "window=fm-tko2" "terminal=term_b2" "backend=orca" "kind=ship"
+fm_write_meta "$STATE_DIR/smo.meta" "window=fm-smo" "terminal=term_c3" "backend=orca" "kind=secondmate"
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
+fm_backend_events_capable() { return 0; }
+# shellcheck disable=SC2329 # Runtime overrides called by the isolated watcher.
+fm_backend_wait_transition() { printf '%s %s\n' "$1" "$2" > "$TMP/session"; shift 4; printf '%s\n' "$*" > "$TMP/panes"; return 1; }
+event_wait_or_sleep
+[ "$(cat "$TMP/session" 2>/dev/null || true)" = "orca orca" ] \
+  || fail "an Orca home must wait on backend orca under one session, got '$(cat "$TMP/session" 2>/dev/null || true)'"
+PANES=$(cat "$TMP/panes" 2>/dev/null || true)
+case "$PANES" in *term_a1*) : ;; *) fail "the first Orca ship terminal must be on the wait list, got '$PANES'" ;; esac
+case "$PANES" in *term_b2*) : ;; *) fail "the second Orca ship terminal must share the same wait, got '$PANES'" ;; esac
+case "$PANES" in *term_c3*) fail "a kind=secondmate Orca terminal must be EXCLUDED from the wait list, got '$PANES'" ;; *) : ;; esac
+[ ! -s "$SLEEP_LOG" ] || fail "an Orca home whose wait returned a clean timeout must not sleep POLL again"
+pass "event_wait_or_sleep: every Orca ship terminal goes on one bounded wait, and kind=secondmate endpoints are excluded"
 
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --
 

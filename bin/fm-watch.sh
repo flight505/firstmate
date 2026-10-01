@@ -389,11 +389,12 @@ PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT
 # connect/subscribe failure) before the push fast-path is disabled for the rest
 # of this watcher process and the loop reverts to pure polling (report section
 # 5c trigger 3: proven-unreliable-at-runtime). A watcher restart re-probes
-# capability, so a transient herdr hiccup self-heals on the next cycle chain.
+# capability, so a transient backend hiccup self-heals on the next cycle chain.
 EVENT_CAP_FAIL_MAX=${FM_EVENT_CAP_FAIL_MAX:-3}
-# Per-process memo for the push-capability probe (fm_backend_events_capable runs
-# a ~220KB `herdr api schema` read, too heavy to repeat every poll). Keyed by
-# "<backend>:<session>"; re-probed only when that key changes.
+# Per-process memo for the push-capability probe (fm_backend_events_capable
+# reads the backend's own schema - ~220KB for `herdr api schema` - too heavy to
+# repeat every poll). Keyed by "<backend>:<session>"; re-probed only when that
+# key changes.
 _event_cap_key=""
 _event_cap_ok=0
 _event_cap_fails=0
@@ -2288,9 +2289,9 @@ heartbeat_scan_finds_actionable() {
 }
 
 # event_wait_or_sleep: the terminal wait of each supervision cycle. For a home
-# with push-capable windows (herdr), it replaces the blind `sleep POLL` with a
-# bounded wait on the backend's native transition stream, so a crew going
-# `blocked` wakes the supervisor sub-second instead of after the stale-pane
+# with push-capable windows (herdr, orca), it replaces the blind `sleep POLL`
+# with a bounded wait on the backend's native transition signal, so a crew going
+# `blocked` wakes the supervisor at once instead of after the stale-pane
 # wedge timer. For every other home - no push-capable window, backend not
 # capable, or the event path proven unreliable this process - it sleeps POLL,
 # byte-for-byte today's behavior. The poll loop above still runs every cycle, so
@@ -2309,11 +2310,11 @@ event_wait_or_sleep() {
     # they are excluded from the fast escalation exactly as the stale loop skips
     # them.
     [ "$(window_kind "$w")" = secondmate ] && continue
-    session=${w%%:*}
+    session=$(fm_backend_push_session "$b" "$w")
     if [ -z "$first_backend" ]; then first_backend=$b; first_session=$session; fi
-    # One socket connection covers one backend+session; a home normally has a
-    # single herdr session. A window in a different backend/session stays on the
-    # poll path this cycle.
+    # One bounded wait covers one backend+session (fm_backend_push_session); a
+    # home normally has a single one. A window in a different backend/session
+    # stays on the poll path this cycle.
     if [ "$b" != "$first_backend" ] || [ "$session" != "$first_session" ]; then
       continue
     fi
@@ -3027,7 +3028,7 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     prev=$(cat "$hf" 2>/dev/null || true)
-    # Busy match: a backend's native semantic state when available (herdr), else
+    # Busy match: a backend's native semantic state when available (herdr, orca), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
     # harness renders its busy indicator) so busy-looking strings in displayed
     # content cannot suppress stale detection. Read once per window per poll and
@@ -3253,7 +3254,7 @@ EOF
     fi
   fi
 
-  # Terminal wait: a bounded native-event wait for push-capable homes (herdr),
-  # else the blind poll sleep. See event_wait_or_sleep.
+  # Terminal wait: a bounded native-event wait for push-capable homes (herdr,
+  # orca), else the blind poll sleep. See event_wait_or_sleep.
   event_wait_or_sleep
 done

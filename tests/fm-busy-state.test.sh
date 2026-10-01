@@ -532,6 +532,37 @@ test_herdr_native_busy_only() {
   pass "herdr's native verdict is trusted for busy only, and records outrank it"
 }
 
+test_orca_native_busy_only() {
+  local state out gen
+  state=$(new_state_dir orca-native)
+  # shellcheck disable=SC2329 # invoked indirectly through fm_busy_classify
+  fm_backend_busy_state() { printf '%s' "$FAKE_NATIVE"; }
+  FAKE_NATIVE=busy
+  out=$(fm_busy_classify orca term-a claude t1 "$state")
+  [ "$out" = "busy orca-native" ] || fail "Orca's native busy with no record must classify busy, got '$out'"
+  FAKE_NATIVE=idle
+  out=$(fm_busy_classify orca term-a claude t1 "$state")
+  [ "$out" = "unknown missing" ] || fail "Orca's native idle must NOT classify idle, got '$out'"
+  FAKE_NATIVE=unknown
+  out=$(fm_busy_classify orca term-a claude t1 "$state")
+  [ "$out" = "unknown missing" ] || fail "Orca's native unknown must stay unknown, got '$out'"
+  # A backend with no native verdict of its own never borrows one.
+  FAKE_NATIVE=busy
+  out=$(fm_busy_classify tmux w1 claude t1 "$state")
+  [ "$out" = "unknown missing" ] || fail "tmux must not classify from a native verdict, got '$out'"
+  # The harness's own semantic record stays the authority in both directions.
+  gen=$("$EV" arm "$state" t1)
+  "$EV" apply "$state" t1 idle --gen "$gen" --source claude-hook --event stop
+  out=$(fm_busy_classify orca term-a claude t1 "$state")
+  [ "$out" = "idle claude-hook" ] || fail "the adapter record must outrank Orca's native busy, got '$out'"
+  "$EV" apply "$state" t1 busy --gen "$gen" --source claude-hook --event user-prompt-submit
+  FAKE_NATIVE=idle
+  out=$(fm_busy_classify orca term-a claude t1 "$state")
+  [ "$out" = "busy claude-hook" ] || fail "Orca's native idle must never mark a recorded working turn idle, got '$out'"
+  unset -f fm_backend_busy_state
+  pass "orca's native verdict is trusted for busy only, and records outrank it"
+}
+
 # The record parser runs inside sourcing callers (the watcher, the daemon, the
 # crew-state reader), so it must not disturb their shell: no clobbered
 # positional parameters and no changed glob setting.
@@ -623,6 +654,7 @@ test_kimi_unverified_gate
 test_cursor_ignores_rendered_and_native_signals
 test_dead_endpoint_overrides
 test_herdr_native_busy_only
+test_orca_native_busy_only
 test_record_read_leaves_caller_shell_intact
 test_boolean_view_never_promotes_unknown
 
