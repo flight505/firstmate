@@ -94,6 +94,411 @@ SH
   chmod +x "$fb/tmux"
 }
 
+# --- native agent state: worktree ps rows and the tui-idle wait --------------
+#
+# The suites above script the fake CLI by call order. The native agent-state
+# reads cannot use that: the tui-idle waits run side by side with no stable
+# order. This second fake answers by COMMAND, from files under
+# $FM_ORCA_RESPONSES, and exits 1 for an ok:false answer as the real CLI does:
+#   show-<handle>.json    `terminal show` answer; absent means a stale handle.
+#   ps.json, ps.<n>.json  `worktree ps` answer; the n-th call prefers ps.<n>.json.
+#   wait-<handle>.json    `terminal wait` answer, held for wait-<handle>.sleep
+#                         seconds first; absent means Orca's own timeout answer
+#                         once --timeout-ms has passed.
+#   agent-context.json    `agent-context` answer.
+# Every shape written here is one recorded live in
+# docs/verification/runtime-backends.md "Orca".
+make_orca_state_fakebin() {  # <dir> -> echoes fakebin dir
+  local fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/orca" <<'SH'
+#!/usr/bin/env bash
+set -u
+LOG="${FM_ORCA_LOG:?}"
+RESP="${FM_ORCA_RESPONSES:?}"
+# One write per call: side-by-side waits must not interleave their log lines.
+printf 'orca %s\n' "$*" >> "$LOG"
+answer() {  # <file>
+  cat "$1"
+  if grep -q '"ok":false' "$1"; then exit 1; fi
+  exit 0
+}
+stale() {
+  printf '{"ok":false,"error":{"code":"terminal_handle_stale","message":"terminal_handle_stale"}}\n'
+  exit 1
+}
+flag() {  # <name> <args...> -> value following --<name>
+  local name=$1 prev=
+  shift
+  for a in "$@"; do
+    [ "$prev" != "--$name" ] || { printf '%s' "$a"; return 0; }
+    prev=$a
+  done
+}
+case "${1:-} ${2:-}" in
+  "terminal show")
+    f="$RESP/show-$(flag terminal "$@").json"
+    [ -f "$f" ] || stale
+    answer "$f"
+    ;;
+  "worktree ps")
+    n=$(( $(cat "$RESP/.ps-count" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$RESP/.ps-count"
+    f="$RESP/ps.$n.json"
+    [ -f "$f" ] || f="$RESP/ps.json"
+    [ -f "$f" ] || { printf '{"ok":false,"error":{"code":"runtime_error","message":"runtime_error"}}\n'; exit 1; }
+    answer "$f"
+    ;;
+  "terminal wait")
+    h=$(flag terminal "$@")
+    f="$RESP/wait-$h.json"
+    if [ -f "$f" ]; then
+      [ ! -f "$RESP/wait-$h.sleep" ] || sleep "$(cat "$RESP/wait-$h.sleep")"
+      answer "$f"
+    fi
+    ms=$(flag timeout-ms "$@")
+    sleep "$(awk -v ms="${ms:-0}" 'BEGIN { printf "%.3f", ms / 1000 }')"
+    printf '{"ok":false,"error":{"code":"timeout","message":"timeout"}}\n'
+    exit 1
+    ;;
+  "agent-context --json")
+    [ -f "$RESP/agent-context.json" ] || exit 1
+    answer "$RESP/agent-context.json"
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/orca"
+  printf '%s\n' "$fb"
+}
+
+orca_state_case() {  # <name> -> sets CASE_DIR LOG RESP FB STATE_DIR
+  CASE_DIR="$TMP_ROOT/$1"
+  mkdir -p "$CASE_DIR/responses" "$CASE_DIR/state"
+  LOG="$CASE_DIR/log"
+  RESP="$CASE_DIR/responses"
+  STATE_DIR="$CASE_DIR/state"
+  : > "$LOG"
+  FB=$(make_orca_state_fakebin "$CASE_DIR")
+}
+
+orca_show() {  # <handle> <tabId> <leafId>
+  printf '{"ok":true,"result":{"terminal":{"handle":"%s","tabId":"%s","leafId":"%s","connected":true,"agentIdentity":"claude","agentWait":null}}}\n' \
+    "$1" "$2" "$3" > "$RESP/show-$1.json"
+}
+
+orca_row() {  # <paneKey> <state> <main-state|-> [stateStartedAt]
+  local since=${4:-1790871156662}
+  if [ "$3" = - ]; then
+    printf '{"paneKey":"%s","parentPaneKey":null,"state":"%s","agentType":"claude","stateStartedAt":%s,"updatedAt":%s}' \
+      "$1" "$2" "$since" "$since"
+  else
+    printf '{"paneKey":"%s","parentPaneKey":null,"state":"%s","agentType":"claude","mainAgent":{"state":"%s","stateStartedAt":%s},"stateStartedAt":%s,"updatedAt":%s}' \
+      "$1" "$2" "$3" "$since" "$since" "$since"
+  fi
+}
+
+orca_ps() {  # <file-name> <row...> -> one worktree holding those agent rows
+  local file=$1 IFS=,
+  shift
+  printf '{"ok":true,"result":{"worktrees":[{"worktreeId":"repo::/wt","status":"working","agents":[%s]}],"totalCount":1,"truncated":false}}\n' \
+    "$*" > "$RESP/$file"
+}
+
+orca_wait_idle() {  # <handle> [hold-seconds]
+  printf '{"ok":true,"result":{"wait":{"handle":"%s","condition":"tui-idle","satisfied":true,"status":"running","exitCode":null}}}\n' \
+    "$1" > "$RESP/wait-$1.json"
+  [ -z "${2:-}" ] || printf '%s' "$2" > "$RESP/wait-$1.sleep"
+}
+
+orca_state_run() {  # <bash-snippet> [args...] -> runs it with the adapter sourced
+  local snippet=$1
+  shift
+  PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; '"$snippet" "$ROOT" "$@"
+}
+
+test_busy_state_reads_the_native_agent_row() {
+  local got label state main want
+  orca_state_case busy-state
+  orca_show term-a tab-a leaf-a
+  while IFS='|' read -r label state main want; do
+    orca_ps ps.json "$(orca_row tab-a:leaf-a "$state" "$main")"
+    got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+    [ "$got" = "$want" ] || fail "busy_state for $label should be $want, got '$got'"
+  done <<'ROWS'
+a turn in flight|working|working|busy
+a finished turn|done|done|idle
+an agent parked on the human|waiting|waiting|unknown
+a finished turn with a background shell still running|working|done|unknown
+a working row with no main-turn state|working|-|unknown
+a done row whose main turn disagrees|done|working|unknown
+a state outside the verified vocabulary|thinking|thinking|unknown
+ROWS
+  assert_contains "$(cat "$LOG")" "orca terminal show --terminal term-a --json" \
+    "busy_state did not resolve the pane key through terminal show"
+  assert_contains "$(cat "$LOG")" "orca worktree ps --json" \
+    "busy_state did not read the agent rows through worktree ps"
+  pass "fm_backend_orca_busy_state: busy and idle each need the row and its main turn to agree; everything else is unknown"
+}
+
+test_busy_state_is_unknown_on_every_unverified_read() {
+  local got
+  orca_state_case busy-state-unknown
+  orca_show term-a tab-a leaf-a
+
+  orca_ps ps.json "$(orca_row tab-b:leaf-b working working)"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+  [ "$got" = unknown ] || fail "a terminal with no agent row must be unknown, got '$got'"
+
+  orca_ps ps.json "$(orca_row tab-a:leaf-a working working)" "$(orca_row tab-a:leaf-a working working)"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+  [ "$got" = unknown ] || fail "two rows claiming one pane must be unknown, got '$got'"
+
+  printf '{"ok":false,"error":{"code":"runtime_error","message":"runtime_error"}}\n' > "$RESP/ps.json"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+  [ "$got" = unknown ] || fail "a failed worktree ps must be unknown, got '$got'"
+
+  # Rows at an unverified nesting, and an answer without the ok envelope, are
+  # speculative shapes: neither may be read as a working agent.
+  printf '{"ok":true,"result":{"agents":[%s]}}\n' "$(orca_row tab-a:leaf-a working working)" > "$RESP/ps.json"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+  [ "$got" = unknown ] || fail "rows outside result.worktrees[].agents must be unknown, got '$got'"
+  printf '{"result":{"worktrees":[{"agents":[%s]}]}}\n' "$(orca_row tab-a:leaf-a working working)" > "$RESP/ps.json"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+  [ "$got" = unknown ] || fail "a worktree ps answer without ok:true must be unknown, got '$got'"
+
+  orca_ps ps.json "$(orca_row tab-a:leaf-a working working)"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-gone')
+  [ "$got" = unknown ] || fail "a stale terminal handle must be unknown, got '$got'"
+
+  # A terminal show answer that names another handle is not this terminal's.
+  printf '{"ok":true,"result":{"terminal":{"handle":"term-other","tabId":"tab-a","leafId":"leaf-a"}}}\n' > "$RESP/show-term-a.json"
+  got=$(orca_state_run 'fm_backend_orca_busy_state term-a')
+  [ "$got" = unknown ] || fail "a terminal show answer for another handle must be unknown, got '$got'"
+  pass "fm_backend_orca_busy_state: a missing row, an ambiguous row, a failed read, and a speculative shape are all unknown"
+}
+
+test_dispatcher_routes_orca_busy_state_and_push_seams() {
+  local out
+  orca_state_case busy-dispatch
+  orca_show term-a tab-a leaf-a
+  orca_ps ps.json "$(orca_row tab-a:leaf-a working working)"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/fm-backend.sh"
+      printf "%s|" "$(fm_backend_busy_state orca term-a)"
+      fm_backend_has_push orca && printf "push|"
+      printf "%s|" "$(fm_backend_push_session orca term-a)"
+      printf "%s|" "$(fm_backend_transition_window orca orca term-a)"
+      printf "%s|" "$(fm_backend_push_session herdr default:wG:pQ)"
+      printf "%s" "$(fm_backend_transition_window herdr default wG:pQ)"' "$ROOT" )
+  [ "$out" = "busy|push|orca|term-a|default|default:wG:pQ" ] \
+    || fail "dispatcher did not route the Orca busy state and push seams, got '$out'"
+  pass "fm-backend dispatcher: routes Orca's native busy state and names one wait session for every Orca terminal"
+}
+
+test_idle_wait_returns_the_first_idle_terminal() {
+  local out rc
+  orca_state_case idle-wait
+  orca_wait_idle term-slow 2
+  orca_wait_idle term-fast
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 4000 term-slow term-fast') || rc=$?
+  [ "$rc" -eq 0 ] || fail "idle_wait should return 0 once a terminal is idle, got rc=$rc"
+  [ "$out" = term-fast ] || fail "idle_wait should print the first idle terminal, got '$out'"
+  assert_contains "$(cat "$LOG")" "orca terminal wait --terminal term-fast --for tui-idle --timeout-ms 4000 --json" \
+    "idle_wait did not call terminal wait with the tui-idle condition and the timeout"
+  pass "fm_backend_orca_idle_wait: waits on every terminal side by side and returns the first idle one"
+}
+
+test_idle_wait_separates_timeout_from_an_unusable_read() {
+  local out rc
+  orca_state_case idle-wait-timeout
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 300 term-busy') || rc=$?
+  [ "$rc" -eq 1 ] && [ -z "$out" ] || fail "Orca's own timeout answer should be a clean timeout (rc 1, no output), got rc=$rc out='$out'"
+
+  printf '{"ok":false,"error":{"code":"terminal_handle_stale","message":"terminal_handle_stale"}}\n' > "$RESP/wait-term-gone.json"
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 300 term-gone') || rc=$?
+  [ "$rc" -eq 2 ] && [ -z "$out" ] || fail "a stale handle should be an unusable read (rc 2), got rc=$rc out='$out'"
+
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 300 term-gone term-busy') || rc=$?
+  [ "$rc" -eq 1 ] || fail "one clean timeout beside a stale handle should still be a clean timeout, got rc=$rc"
+
+  # Three answers that are not the verified satisfied shape: an unsatisfied
+  # result, a result naming another terminal, and another wait condition.
+  printf '{"ok":true,"result":{"wait":{"handle":"term-x","condition":"tui-idle","satisfied":false}}}\n' > "$RESP/wait-term-x.json"
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 300 term-x') || rc=$?
+  [ "$rc" -eq 2 ] && [ -z "$out" ] || fail "an unsatisfied result must never read as idle, got rc=$rc out='$out'"
+  printf '{"ok":true,"result":{"wait":{"handle":"term-other","condition":"tui-idle","satisfied":true}}}\n' > "$RESP/wait-term-x.json"
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 300 term-x') || rc=$?
+  [ "$rc" -eq 2 ] && [ -z "$out" ] || fail "a result naming another terminal must never read as idle, got rc=$rc out='$out'"
+  printf '{"ok":true,"result":{"wait":{"handle":"term-x","condition":"exit","satisfied":true}}}\n' > "$RESP/wait-term-x.json"
+  rc=0
+  out=$(orca_state_run 'fm_backend_orca_idle_wait 300 term-x') || rc=$?
+  [ "$rc" -eq 2 ] && [ -z "$out" ] || fail "a satisfied exit wait must never read as idle, got rc=$rc out='$out'"
+
+  rc=0
+  orca_state_run 'fm_backend_orca_idle_wait 300' >/dev/null || rc=$?
+  [ "$rc" -eq 2 ] || fail "idle_wait with no terminal should be unusable, got rc=$rc"
+  pass "fm_backend_orca_idle_wait: only the verified satisfied answer is idle, and a timeout is kept apart from an unusable read"
+}
+
+test_events_capable_reads_orcas_command_schema() {
+  local rc
+  orca_state_case events-capable
+  cat > "$RESP/agent-context.json" <<'JSON'
+{"schemaVersion":1,"commandCount":3,"commands":[
+ {"command":"terminal wait","usage":"orca terminal wait [--terminal <handle>] --for exit|tui-idle [--timeout-ms <ms>] [--json]","flags":["help","json","pairing-code","environment","terminal","for","timeout-ms"]},
+ {"command":"terminal show","usage":"orca terminal show [--terminal <handle>] [--json]","flags":["help","json","pairing-code","environment","terminal"]},
+ {"command":"worktree ps","usage":"orca worktree ps [--limit <n>] [--json]","flags":["help","json","pairing-code","environment","limit"]}
+]}
+JSON
+  orca_state_run 'fm_backend_orca_events_capable' || fail "a schema listing the three commands and their flags should be capable"
+
+  sed 's/,"timeout-ms"//' "$RESP/agent-context.json" > "$RESP/a.json" && mv "$RESP/a.json" "$RESP/agent-context.json"
+  rc=0
+  orca_state_run 'fm_backend_orca_events_capable' || rc=$?
+  [ "$rc" -ne 0 ] || fail "a terminal wait without --timeout-ms must not be capable"
+
+  cat > "$RESP/agent-context.json" <<'JSON'
+{"schemaVersion":1,"commandCount":3,"commands":[
+ {"command":"terminal wait","usage":"orca terminal wait [--terminal <handle>] --for exit [--timeout-ms <ms>] [--json]","flags":["json","terminal","for","timeout-ms"]},
+ {"command":"terminal show","usage":"orca terminal show","flags":["json","terminal"]},
+ {"command":"worktree ps","usage":"orca worktree ps","flags":["json"]}
+]}
+JSON
+  rc=0
+  orca_state_run 'fm_backend_orca_events_capable' || rc=$?
+  [ "$rc" -ne 0 ] || fail "a terminal wait without the tui-idle condition must not be capable"
+
+  rm -f "$RESP/agent-context.json"
+  rc=0
+  orca_state_run 'fm_backend_orca_events_capable' || rc=$?
+  [ "$rc" -ne 0 ] || fail "an Orca with no command schema must not be capable"
+  FM_BACKEND_ORCA_EVENTS_FORCE=1 orca_state_run 'fm_backend_orca_events_capable' \
+    || fail "FM_BACKEND_ORCA_EVENTS_FORCE=1 should force the capable verdict"
+  pass "fm_backend_orca_events_capable: gates on Orca's own command schema, not on a version number"
+}
+
+# wait_transition <timeout-secs> <terminal...> -> sets WT_OUT WT_RC WT_ELAPSED
+orca_wait_transition() {
+  local started
+  started=$(date +%s)
+  WT_RC=0
+  # shellcheck disable=SC2016  # Single quotes are deliberate: the inner bash expands them.
+  WT_OUT=$(FM_BACKEND_ORCA_EVENTS_FORCE=1 FM_BACKEND_ORCA_IDLE_CONFIRM_MS=300 \
+    orca_state_run 'state=$1; t=$2; shift 2; fm_backend_orca_wait_transition orca "$t" "$state" "$@"' "$STATE_DIR" "$@") || WT_RC=$?
+  WT_ELAPSED=$(( $(date +%s) - started ))
+}
+
+test_wait_transition_escalates_a_waiting_terminal_once_per_episode() {
+  local marker
+  orca_state_case wait-level
+  marker="$STATE_DIR/.orca-escalated-term-a"
+  orca_show term-a tab-a leaf-a
+  orca_ps ps.json "$(orca_row tab-a:leaf-a waiting waiting 1111)"
+  orca_wait_idle term-a
+
+  orca_wait_transition 5 term-a
+  [ "$WT_RC" -eq 0 ] || fail "a waiting terminal with an idle TUI should be returned at once, got rc=$WT_RC"
+  [ "$WT_ELAPSED" -lt 4 ] || fail "the waiting terminal should be returned without sleeping the budget, took ${WT_ELAPSED}s"
+  [ "$WT_OUT" = "$(printf 'term-a\t\t\tblocked\t')" ] \
+    || fail "the record should name the terminal and the shared blocked status, got '$WT_OUT'"
+  [ ! -e "$marker" ] || fail "the dedupe marker must not exist before the caller commits the escalation"
+
+  # Uncommitted: the same episode is still eligible, as after a failed enqueue.
+  orca_wait_transition 5 term-a
+  [ "$WT_RC" -eq 0 ] || fail "an uncommitted waiting episode should be returned again, got rc=$WT_RC"
+
+  # shellcheck disable=SC2016  # Single quotes are deliberate: the inner bash expands them.
+  orca_state_run '. "$0/bin/fm-backend.sh"; fm_backend_commit_transition orca "$1" orca "$2"' "$STATE_DIR" "$WT_OUT" \
+    || fail "commit_transition should record the escalated episode"
+  [ "$(cat "$marker" 2>/dev/null)" = 1111 ] || fail "the marker should hold the episode stamp, got '$(cat "$marker" 2>/dev/null)'"
+
+  orca_wait_transition 1 term-a
+  [ "$WT_RC" -eq 1 ] || fail "a committed waiting episode must not be escalated twice, got rc=$WT_RC out='$WT_OUT'"
+
+  # A different episode re-escalates even though no working read fell between.
+  orca_ps ps.json "$(orca_row tab-a:leaf-a waiting waiting 2222)"
+  orca_wait_transition 5 term-a
+  [ "$WT_RC" -eq 0 ] || fail "a new waiting episode should be escalated, got rc=$WT_RC"
+
+  # shellcheck disable=SC2016  # Single quotes are deliberate: the inner bash expands them.
+  orca_state_run '. "$0/bin/fm-backend.sh"; fm_backend_clear_transition orca "$1" term-a' "$STATE_DIR"
+  [ ! -e "$marker" ] && [ ! -e "$marker.pending" ] || fail "clear_transition should remove the marker and its staged stamp"
+  pass "fm_backend_orca_wait_transition: a terminal parked on the human is returned at once, and once per waiting episode"
+}
+
+test_wait_transition_does_not_trust_waiting_while_the_tui_is_busy() {
+  orca_state_case wait-stale-waiting
+  orca_show term-a tab-a leaf-a
+  # Orca still says waiting, but the tui-idle wait times out: the human already
+  # approved and the tool is running. That is work, not a prompt.
+  orca_ps ps.json "$(orca_row tab-a:leaf-a waiting waiting 1111)"
+  orca_wait_transition 2 term-a
+  [ "$WT_RC" -eq 1 ] || fail "a waiting row over a busy TUI must not be escalated, got rc=$WT_RC out='$WT_OUT'"
+  [ -z "$WT_OUT" ] || fail "no record should be printed for a waiting row over a busy TUI, got '$WT_OUT'"
+  [ ! -e "$STATE_DIR/.orca-escalated-term-a" ] || fail "no marker should be written for an escalation that never happened"
+  pass "fm_backend_orca_wait_transition: a waiting row is escalated only when the tui-idle wait agrees"
+}
+
+test_wait_transition_catches_a_turn_that_parks_mid_wait() {
+  orca_state_case wait-edge
+  orca_show term-a tab-a leaf-a
+  orca_show term-b tab-b leaf-b
+  orca_ps ps.json "$(orca_row tab-a:leaf-a working working 1111)" "$(orca_row tab-b:leaf-b working working 1111)"
+  orca_ps ps.2.json "$(orca_row tab-a:leaf-a working working 1111)" "$(orca_row tab-b:leaf-b waiting waiting 3333)"
+  orca_wait_idle term-b 1
+  printf 'old' > "$STATE_DIR/.orca-escalated-term-a"
+  orca_wait_transition 8 term-a term-b
+  [ "$WT_RC" -eq 0 ] || fail "a turn that parks on the human mid-wait should be returned, got rc=$WT_RC"
+  [ "$WT_ELAPSED" -lt 6 ] || fail "the parked turn should end the wait early, took ${WT_ELAPSED}s"
+  [ "$WT_OUT" = "$(printf 'term-b\t\t\tblocked\t')" ] || fail "the record should name the parked terminal, got '$WT_OUT'"
+  [ ! -e "$STATE_DIR/.orca-escalated-term-a" ] || fail "a working read should clear that terminal's stale escalation marker"
+  pass "fm_backend_orca_wait_transition: blocks on the tui-idle wait of every working terminal and returns the one that parks"
+}
+
+test_wait_transition_spends_the_whole_budget_on_ordinary_turns() {
+  orca_state_case wait-budget
+  orca_show term-a tab-a leaf-a
+  orca_show term-b tab-b leaf-b
+  orca_show term-c tab-c leaf-c
+  # term-a ends its turn mid-wait, term-b is already idle, and term-c ended its
+  # turn with a background shell still running. None of them is parked on the
+  # human, so the wait must neither return early nor spin.
+  orca_ps ps.json "$(orca_row tab-a:leaf-a working working)" "$(orca_row tab-b:leaf-b "done" "done")" "$(orca_row tab-c:leaf-c working "done")"
+  orca_ps ps.2.json "$(orca_row tab-a:leaf-a "done" "done")" "$(orca_row tab-b:leaf-b "done" "done")" "$(orca_row tab-c:leaf-c working "done")"
+  orca_wait_idle term-a 1
+  orca_wait_transition 3 term-a term-b term-c
+  [ "$WT_RC" -eq 1 ] || fail "a turn that simply ends should be a clean timeout, got rc=$WT_RC out='$WT_OUT'"
+  [ "$WT_ELAPSED" -ge 3 ] || fail "the wait must spend its whole budget rather than return early, took ${WT_ELAPSED}s"
+  [ "$(grep -c 'orca terminal wait' "$LOG")" -eq 1 ] \
+    || fail "only the terminal in a turn should be waited on, and only once: $(grep 'orca terminal wait' "$LOG")"
+  assert_contains "$(grep 'orca terminal wait' "$LOG")" "--terminal term-a" \
+    "the tui-idle wait should target the one terminal in a turn"
+  pass "fm_backend_orca_wait_transition: an ordinary turn end is left to the next cycle, after the whole budget has passed"
+}
+
+test_wait_transition_reports_an_unreadable_orca() {
+  orca_state_case wait-unusable
+  orca_show term-a tab-a leaf-a
+  orca_wait_transition 1 term-a
+  [ "$WT_RC" -eq 2 ] || fail "a failed worktree ps should make the wait unusable (rc 2), got rc=$WT_RC"
+  orca_ps ps.json "$(orca_row tab-a:leaf-a working working)"
+  orca_wait_transition 1
+  [ "$WT_RC" -eq 2 ] || fail "a wait with no terminal should be unusable (rc 2), got rc=$WT_RC"
+  WT_RC=0
+  # shellcheck disable=SC2016  # Single quotes are deliberate: the inner bash expands them.
+  FM_BACKEND_ORCA_EVENTS_FORCE=0 orca_state_run 'fm_backend_orca_wait_transition orca 1 "$1" term-a' "$STATE_DIR" >/dev/null || WT_RC=$?
+  [ "$WT_RC" -eq 2 ] || fail "an Orca without the native wait should be unusable (rc 2), got rc=$WT_RC"
+  pass "fm_backend_orca_wait_transition: an unreadable or incapable Orca returns 2 so the watcher sleeps and falls back to polling"
+}
+
 test_capture_reads_terminal_tail_json() {
   local out
   orca_case capture-tail
@@ -1731,3 +2136,14 @@ test_teardown_refuses_orca_worktree_without_terminal_handle
 test_secondmate_force_teardown_removes_orca_child_via_orca
 test_secondmate_force_teardown_refuses_orca_child_id_path_mismatch
 test_secondmate_force_teardown_refuses_partial_orca_child
+test_busy_state_reads_the_native_agent_row
+test_busy_state_is_unknown_on_every_unverified_read
+test_dispatcher_routes_orca_busy_state_and_push_seams
+test_idle_wait_returns_the_first_idle_terminal
+test_idle_wait_separates_timeout_from_an_unusable_read
+test_events_capable_reads_orcas_command_schema
+test_wait_transition_escalates_a_waiting_terminal_once_per_episode
+test_wait_transition_does_not_trust_waiting_while_the_tui_is_busy
+test_wait_transition_catches_a_turn_that_parks_mid_wait
+test_wait_transition_spends_the_whole_budget_on_ordinary_turns
+test_wait_transition_reports_an_unreadable_orca

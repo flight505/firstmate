@@ -55,7 +55,7 @@ An ordinary metadata-routed `fm-send.sh` text steer becomes a durable steering-i
 On the typed plane, `fm-send.sh` verifies composer clearance through the fleet-wide classifier in `bin/fm-composer-lib.sh`, retrying Enter without retyping when a slash popup first fills an argument placeholder.
 The composer read is one bounded tail of the live terminal and never pages backward into scrollback, so a stale startup banner cannot compete with the bottom-anchored composer.
 A bare shell row is `unknown`, not an empty agent composer, and plain-text captures degrade a glyph row carrying trailing text to `unknown` rather than a false `pending`.
-The watcher has no native Orca busy signal, so each harness adapter's semantic lifecycle supplies worker state.
+Each harness adapter's semantic lifecycle stays the authority for worker state, and Orca's own agent state is read beside it as described in [Native agent state](#native-agent-state).
 Grok alone retains its isolated rendered-tail fallback.
 
 Cleanup keeps all shared Firstmate safety checks.
@@ -83,22 +83,51 @@ A terminal whose agent exited back to its shell still reads `connected=true`, so
 [`verification/runtime-backends.md`](verification/runtime-backends.md#orca-agent-state) owns the live evidence for both readings.
 Because neither field can prove that an agent stopped while its terminal stays open, `bin/fm-control.sh <id> exit` and `relaunch` refuse on Orca ([`agent-control.md`](agent-control.md)).
 
+## Native agent state
+
+Orca tracks the agent in each terminal through its own status hooks, and Firstmate reads that state for an Orca task in two places.
+
+The busy read asks `orca terminal show` for the terminal's tab and leaf ids, then finds the one `orca worktree ps` agent row whose `paneKey` joins them.
+A row is busy only when its `state` and its main-turn state are both `working`, and idle only when both are `done`.
+A missing row, more than one row for the pane, a turn that ended with a background shell still running, a `waiting` row, and any failed read are all unknown.
+That verdict is trusted the way Herdr's is: a native busy stands in only when the task has no semantic record of its own, a native idle never does, and a valid record outranks both, so the native state can never mark a working agent idle.
+
+The watcher's wait replaces its fixed sleep between cycles with a bounded wait on the same state.
+Each cycle it reads the row of every Orca ship and scout terminal once, then blocks on `orca terminal wait --for tui-idle` for the terminals that are in a turn.
+A terminal whose row is `waiting` while its TUI is idle is parked on a human, such as a permission dialog or a question, and is surfaced at once instead of after the stale timer.
+Each waiting episode is surfaced once, keyed on the row's own start time.
+A turn that simply ends is left to the ordinary status and turn-end handling on the next cycle.
+Secondmate terminals are never on that wait, and a worker that declared its own wait is absorbed rather than surfaced.
+
+Orca keeps reporting `waiting` after the human approves, for as long as the approved tool runs.
+A `waiting` row is therefore never read as idle, and it is surfaced only when the tui-idle wait independently agrees.
+A tui-idle timeout alone proves nothing, because a terminal with no agent in it times out the same way.
+
+The wait is used only when `orca agent-context --json` lists `terminal wait` with the `tui-idle` condition and `--timeout-ms`, `terminal show`, and `worktree ps`.
+Polling runs every cycle regardless and remains the permanent fallback, under the same watcher rules as Herdr's [polling fallback](herdr-backend.md#polling-fallback).
+
 ## Active limits
 
 - Orca is macOS-only and explicit-only.
 - The app must be running and report ready.
 - `bin/fm-control.sh <id> exit` and `relaunch` are refused, and a secondmate whose agent exited inside an open terminal is not auto-recovered; see [Recovery](#recovery).
 - Orca exposes no stable CLI version or protocol marker, so readiness is the compatibility gate rather than a version floor.
-- Only the verified terminal-handle and worktree result fields are accepted; speculative response shapes are rejected.
+- Only the verified terminal-handle, worktree, agent-row, and tui-idle wait result fields are accepted; speculative response shapes are rejected.
+- Native agent state exists only for an agent whose harness reports to Orca's status hooks; a terminal with no agent row reads unknown.
+- `orca worktree ps` pages its rows, so a row beyond the returned page reads unknown rather than idle.
 - Orca's worktree shape is unverified against the spawn-time Claude workspace-trust check in `bin/fm-claude-trust.sh`, which refuses any path that is not a linked git worktree sharing the project's git common dir, so a claude spawn on Orca fails loudly at that check rather than launching if Orca clones instead of linking.
 
 ## Regression entry points
 
 ```sh
 tests/fm-backend-orca.test.sh
+tests/fm-backend-orca-smoke.test.sh
 tests/fm-backend.test.sh
 tests/fm-bootstrap.test.sh
+tests/fm-busy-state.test.sh
+tests/fm-supervision-events.test.sh
 tests/fm-teardown-endpoint-safety.test.sh
 ```
 
+`tests/fm-backend-orca-smoke.test.sh` is the read-only check against the real app and skips when Orca is absent or not ready.
 [`verification/runtime-backends.md`](verification/runtime-backends.md#orca) records the real readiness and response-shape smoke.

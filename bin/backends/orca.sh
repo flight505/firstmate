@@ -19,6 +19,12 @@
 # shellcheck source=bin/fm-agent-process-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/../fm-agent-process-lib.sh"
 
+# Shared normalized-transition shape and status->action policy table, reused by
+# the native agent-state wait at the end of this file so Orca's `waiting` state
+# follows the same supervision policy as every other push-capable backend.
+# shellcheck source=bin/fm-transition-lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/../fm-transition-lib.sh"
+
 fm_backend_orca_tool_check() {
   command -v orca >/dev/null 2>&1 || { echo "error: backend=orca selected but the 'orca' CLI is not installed" >&2; return 1; }
 }
@@ -427,4 +433,392 @@ fm_backend_orca_send_text_submit() {  # <terminal-id> <text> <retries> <enter-sl
 fm_backend_orca_kill() {  # <terminal-id>
   fm_backend_orca_tool_check || return 1
   orca terminal close --terminal "$1" --json >/dev/null 2>&1 || true
+}
+
+# --- native agent state: worktree ps rows and the tui-idle wait --------------
+#
+# Orca reports the agent in each terminal through two native surfaces. Both were
+# verified live; docs/verification/runtime-backends.md "Orca" records the exact
+# response shapes, and only those shapes are accepted here.
+#
+#   orca worktree ps --json
+#       One row per agent, fed by Orca's own status hooks and keyed by
+#       `paneKey` ("<tabId>:<leafId>", the two ids `orca terminal show` reports
+#       for a terminal handle). `state` is working, waiting, or done, and
+#       `mainAgent.state` is the same vocabulary for the main turn alone: a
+#       turn that ended with a background shell still running reads
+#       state=working beside mainAgent.state=done.
+#   orca terminal wait --terminal <handle> --for tui-idle --timeout-ms <ms> --json
+#       Answers `result.wait.satisfied=true` once the TUI is idle - at its
+#       prompt or at a permission dialog - and `error.code=timeout` otherwise.
+#       A timeout is NOT proof of work: a terminal with no agent in it times
+#       out the same way.
+#
+# Three rules follow from what the live run showed, and every reader below
+# keeps them:
+#   - Only a `working` row whose main turn is also `working` is busy, and only
+#     a `done` row whose main turn is also `done` is idle. No row, a
+#     disagreeing pair, and an unrecognized state are all unknown.
+#   - `waiting` is never idle on its own word. Orca keeps reporting it after
+#     the human approves, for as long as the approved tool runs, so a waiting
+#     row is escalated only when the tui-idle wait independently agrees.
+#   - Orca drops a row within seconds of its agent exiting or being killed, so
+#     a row is never a registration left behind over a bare shell.
+
+# Dedupe marker for an escalated waiting episode, one per terminal under the
+# state dir. It holds the row's `stateStartedAt`, so a later, different
+# waiting episode re-escalates even when no `working` read fell in between.
+FM_BACKEND_ORCA_ESCALATED_PREFIX=".orca-escalated-"
+# How long one tui-idle read may take to agree that a `waiting` row really is
+# parked on the human. A live dialog answers at once; an approved tool that is
+# still running does not answer at all.
+FM_BACKEND_ORCA_IDLE_CONFIRM_MS=${FM_BACKEND_ORCA_IDLE_CONFIRM_MS:-1500}
+
+# fm_backend_orca_pane_key: the `paneKey` Orca's agent rows carry for
+# <terminal-id>, built from the `tabId` and `leafId` of a `terminal show`
+# answer that names the same handle. Fails on any other shape.
+fm_backend_orca_pane_key() {  # <terminal-id> -> <tabId>:<leafId>
+  local terminal=$1 out
+  fm_backend_orca_tool_check 2>/dev/null || return 1
+  out=$(orca terminal show --terminal "$terminal" --json 2>/dev/null) || return 1
+  printf '%s' "$out" | node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (err) {
+  process.exit(1);
+}
+const term = data && data.ok === true && data.result && data.result.terminal;
+const id = (v) => typeof v === "string" && v !== "";
+if (!term || term.handle !== process.argv[1] || !id(term.tabId) || !id(term.leafId)) process.exit(1);
+process.stdout.write(term.tabId + ":" + term.leafId);
+' "$terminal"
+}
+
+fm_backend_orca_ps_json() {
+  fm_backend_orca_tool_check 2>/dev/null || return 1
+  orca worktree ps --json 2>/dev/null
+}
+
+# fm_backend_orca_ps_row: the one agent row for <pane-key> in a `worktree ps`
+# answer on stdin, as "<state> <main-state> <state-started-at>" with `-` for an
+# absent second or third field. Returns 1 when no single row matches and 2 when
+# the answer itself is not the verified shape.
+fm_backend_orca_ps_row() {  # <pane-key> (stdin: worktree ps JSON)
+  node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (err) {
+  process.exit(2);
+}
+const worktrees = data && data.ok === true && data.result && data.result.worktrees;
+if (!Array.isArray(worktrees)) process.exit(2);
+const rows = [];
+for (const wt of worktrees) {
+  if (!wt || !Array.isArray(wt.agents)) continue;
+  for (const agent of wt.agents) {
+    if (agent && agent.paneKey === process.argv[1]) rows.push(agent);
+  }
+}
+if (rows.length !== 1) process.exit(1);
+const token = (v) => (typeof v === "string" && /^[a-z][a-z-]*$/.test(v) ? v : "");
+const row = rows[0];
+const state = token(row.state);
+if (!state) process.exit(1);
+const main = token(row.mainAgent && row.mainAgent.state) || "-";
+const since = Number.isSafeInteger(row.stateStartedAt) && row.stateStartedAt > 0 ? String(row.stateStartedAt) : "-";
+process.stdout.write(state + " " + main + " " + since);
+' "$1"
+}
+
+# fm_backend_orca_agent_status_raw: one `terminal show` plus one `worktree ps`
+# read for <terminal-id>, echoing its row as fm_backend_orca_ps_row prints it.
+fm_backend_orca_agent_status_raw() {  # <terminal-id>
+  local key ps
+  key=$(fm_backend_orca_pane_key "$1") || return 1
+  ps=$(fm_backend_orca_ps_json) || return 1
+  printf '%s' "$ps" | fm_backend_orca_ps_row "$key"
+}
+
+# fm_backend_orca_classify_agent_status: busy and idle each need Orca's row
+# state and its main-turn state to agree; see the rules in the block header.
+fm_backend_orca_classify_agent_status() {  # <state> <main-state>
+  case "$1:$2" in
+    working:working) printf 'busy' ;;
+    done:done) printf 'idle' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# fm_backend_orca_busy_state: semantic busy state from Orca's own agent row.
+# Any failed or unrecognized read is unknown, never idle.
+fm_backend_orca_busy_state() {  # <terminal-id> -> busy|idle|unknown
+  local raw main
+  raw=$(fm_backend_orca_agent_status_raw "$1") || { printf 'unknown'; return 0; }
+  main=${raw#* }
+  fm_backend_orca_classify_agent_status "${raw%% *}" "${main%% *}"
+}
+
+# fm_backend_orca_idle_wait: block until the first of <terminal-id...> reports
+# its TUI idle, up to <timeout-ms>. Prints that terminal id and returns 0;
+# returns 1 when none went idle and at least one wait ended in Orca's own
+# timeout answer, and 2 when no wait gave a recognized answer at all. The waits
+# run side by side as children of one short-lived reader, which stops the rest
+# as soon as one is satisfied and never outlives its budget by more than a few
+# seconds.
+fm_backend_orca_idle_wait() {  # <timeout-ms> <terminal-id...>
+  local ms=$1
+  shift
+  case "$ms" in ''|*[!0-9]*|0) return 2 ;; esac
+  [ "$#" -gt 0 ] || return 2
+  fm_backend_orca_tool_check 2>/dev/null || return 2
+  node -e '
+const fs = require("fs");
+const { spawn } = require("child_process");
+const ms = process.argv[1];
+const handles = process.argv.slice(2);
+const kids = [];
+let pending = handles.length;
+let clean = 0;
+let finished = false;
+function finish(code, out) {
+  if (finished) return;
+  finished = true;
+  for (const kid of kids) {
+    try {
+      kid.kill("SIGTERM");
+    } catch (err) {}
+  }
+  if (out) fs.writeSync(1, out);
+  process.exit(code);
+}
+for (const handle of handles) {
+  let buf = "";
+  let settled = false;
+  const settle = (spawned) => {
+    if (settled) return;
+    settled = true;
+    let data = null;
+    if (spawned) {
+      try {
+        data = JSON.parse(buf);
+      } catch (err) {}
+    }
+    const wait = data && data.ok === true && data.result && data.result.wait;
+    if (wait && wait.handle === handle && wait.condition === "tui-idle" && wait.satisfied === true) {
+      finish(0, handle);
+      return;
+    }
+    if (data && data.ok === false && data.error && data.error.code === "timeout") clean += 1;
+    pending -= 1;
+    if (pending === 0) finish(clean > 0 ? 1 : 2);
+  };
+  const kid = spawn(
+    "orca",
+    ["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", ms, "--json"],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
+  kids.push(kid);
+  kid.stdout.on("data", (chunk) => {
+    buf += chunk;
+  });
+  kid.on("error", () => settle(false));
+  kid.on("close", () => settle(true));
+}
+setTimeout(() => finish(2), Number(ms) + 5000);
+process.on("SIGTERM", () => finish(2));
+process.on("SIGINT", () => finish(2));
+' "$ms" "$@"
+}
+
+# fm_backend_orca_events_capable: the capability gate for the native wait.
+# Orca prints its own machine-readable command schema, so the gate asks that
+# schema for the three commands and flags this file relies on rather than
+# comparing version numbers. FM_BACKEND_ORCA_EVENTS_FORCE overrides the verdict
+# for tests (1 = capable, 0 = incapable) without touching the real binary.
+fm_backend_orca_events_capable() {  # [<session>]
+  local out
+  case "${FM_BACKEND_ORCA_EVENTS_FORCE:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  fm_backend_orca_tool_check 2>/dev/null || return 1
+  out=$(orca agent-context --json 2>/dev/null) || return 1
+  printf '%s' "$out" | node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (err) {
+  process.exit(1);
+}
+const commands = data && Array.isArray(data.commands) ? data.commands : [];
+const need = {
+  "terminal wait": ["terminal", "for", "timeout-ms", "json"],
+  "terminal show": ["terminal", "json"],
+  "worktree ps": ["json"],
+};
+for (const name of Object.keys(need)) {
+  const cmd = commands.find((c) => c && c.command === name);
+  if (!cmd || !Array.isArray(cmd.flags)) process.exit(1);
+  for (const flag of need[name]) {
+    if (!cmd.flags.includes(flag)) process.exit(1);
+  }
+}
+const wait = commands.find((c) => c && c.command === "terminal wait");
+if (typeof wait.usage !== "string" || !wait.usage.includes("tui-idle")) process.exit(1);
+'
+}
+
+# fm_backend_orca_normalize_status: Orca's row state in the shared agent-state
+# vocabulary of bin/fm-transition-lib.sh. `waiting` is Orca's word for an agent
+# parked on the human, which that vocabulary calls `blocked`.
+fm_backend_orca_normalize_status() {  # <state>
+  case "$1" in
+    working) printf 'working' ;;
+    waiting) printf 'blocked' ;;
+    done) printf 'done' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+fm_backend_orca_escalation_marker() {  # <state_dir> <terminal-id>
+  local key
+  key=$(printf '%s' "$2" | tr ':/.' '___')
+  printf '%s/%s%s' "$1" "$FM_BACKEND_ORCA_ESCALATED_PREFIX" "$key"
+}
+
+# fm_backend_orca_reconcile_row: route one terminal's row through the shared
+# policy table. Returns 0 and prints the normalized record for a waiting
+# episode that has not been escalated yet and that the tui-idle wait agrees is
+# parked; returns 3 when the terminal is in a turn whose end is worth waiting
+# for; returns 1 for everything else. <idle-proven> is 1 when the caller has
+# just seen this terminal's tui-idle wait satisfied, which is that agreement.
+# The episode stamp is staged beside the marker and only becomes the marker
+# when the caller commits, so a wake that was never queued stays eligible.
+fm_backend_orca_reconcile_row() {  # <state_dir> <terminal-id> <row> <idle-proven>
+  local state=$1 terminal=$2 row=$3 idle_proven=$4 status main since marker rc
+  status=$(fm_backend_orca_normalize_status "${row%% *}")
+  main=${row#* }
+  main=${main%% *}
+  since=${row##* }
+  marker=$(fm_backend_orca_escalation_marker "$state" "$terminal")
+  case "$(fm_transition_policy "$status")" in
+    actionable)
+      if [ -e "$marker" ] && [ "$(cat "$marker" 2>/dev/null || true)" = "$since" ]; then
+        return 1
+      fi
+      if [ "$idle_proven" != 1 ]; then
+        rc=0
+        fm_backend_orca_idle_wait "$FM_BACKEND_ORCA_IDLE_CONFIRM_MS" "$terminal" >/dev/null || rc=$?
+        case "$rc" in
+          0) ;;
+          1) return 3 ;;
+          *) return 1 ;;
+        esac
+      fi
+      printf '%s' "$since" > "$marker.pending" || return 1
+      fm_transition_record "$terminal" "" "" "$status" ""
+      return 0
+      ;;
+    absorb)
+      rm -f "$marker" "$marker.pending" 2>/dev/null || true
+      # A main turn that is already over leaves the TUI idle while a background
+      # shell keeps the row working, so there is no turn end left to wait for.
+      [ "$main" != "done" ] || return 1
+      return 3
+      ;;
+  esac
+  return 1
+}
+
+fm_backend_orca_commit_transition() {  # <state_dir> <session> <record>
+  local marker terminal
+  terminal=$(fm_transition_pane_id "$3")
+  [ -n "$terminal" ] || return 1
+  marker=$(fm_backend_orca_escalation_marker "$1" "$terminal")
+  if [ -e "$marker.pending" ]; then
+    mv -f "$marker.pending" "$marker"
+  else
+    : > "$marker"
+  fi
+}
+
+fm_backend_orca_clear_transition() {  # <state_dir> <terminal-id>
+  local marker
+  [ -n "${2:-}" ] || return 0
+  marker=$(fm_backend_orca_escalation_marker "$1" "$2")
+  rm -f "$marker" "$marker.pending" 2>/dev/null || true
+}
+
+# fm_backend_orca_wait_transition: the watcher's bounded wait for an Orca home.
+# Instead of sleeping blind it reads every listed terminal's row once, then
+# blocks on Orca's tui-idle wait for the ones still in a turn, and returns the
+# moment one of them parks on the human. It prints the normalized record and
+# returns 0 for a fresh waiting episode; returns 1 once the whole budget has
+# passed with nothing to escalate, so the caller has already slept; and returns
+# 2 when Orca could not be read, so the caller sleeps the budget itself. A turn
+# that simply ends is left to the watcher's ordinary status and turn-end
+# handling on its next cycle, exactly as the shared policy defers it.
+fm_backend_orca_wait_transition() {  # <session> <timeout_secs> <state_dir> <terminal-id...>
+  local timeout=$2 state=$3
+  shift 3
+  [ "$#" -gt 0 ] || return 2
+  case "$timeout" in ''|*[!0-9]*) return 2 ;; esac
+  if [ "${FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED:-0}" != 1 ]; then
+    fm_backend_orca_events_capable || return 2
+  fi
+  local ps terminal other key row hit rc started now remaining
+  local busy=() rest=()
+  started=$(date +%s)
+  ps=$(fm_backend_orca_ps_json) || return 2
+  for terminal in "$@"; do
+    key=$(fm_backend_orca_pane_key "$terminal") || continue
+    rc=0
+    row=$(printf '%s' "$ps" | fm_backend_orca_ps_row "$key") || rc=$?
+    [ "$rc" -ne 2 ] || return 2
+    [ "$rc" -eq 0 ] || continue
+    rc=0
+    hit=$(fm_backend_orca_reconcile_row "$state" "$terminal" "$row" 0) || rc=$?
+    case "$rc" in
+      0)
+        printf '%s' "$hit"
+        return 0
+        ;;
+      3) busy+=("$terminal") ;;
+    esac
+  done
+  while [ "${#busy[@]}" -gt 0 ]; do
+    now=$(date +%s)
+    remaining=$(( timeout - (now - started) ))
+    [ "$remaining" -gt 0 ] || return 1
+    rc=0
+    terminal=$(fm_backend_orca_idle_wait "$(( remaining * 1000 ))" "${busy[@]}") || rc=$?
+    case "$rc" in
+      0) ;;
+      1) return 1 ;;
+      *) return 2 ;;
+    esac
+    # This terminal's turn reached an idle TUI. It leaves the wait set whatever
+    # its row says, so an idle terminal can never make this loop spin.
+    rest=()
+    for other in "${busy[@]}"; do
+      [ "$other" = "$terminal" ] || rest+=("$other")
+    done
+    busy=(${rest[@]+"${rest[@]}"})
+    row=$(fm_backend_orca_agent_status_raw "$terminal") || continue
+    rc=0
+    hit=$(fm_backend_orca_reconcile_row "$state" "$terminal" "$row" 1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '%s' "$hit"
+      return 0
+    fi
+  done
+  now=$(date +%s)
+  remaining=$(( timeout - (now - started) ))
+  [ "$remaining" -le 0 ] || sleep "$remaining"
+  return 1
 }

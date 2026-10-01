@@ -414,7 +414,7 @@ family_for_basename() {
     fm-backend-zellij.test.sh|fm-backend-zellij-smoke.test.sh)
       printf '%s\n' zellij
       ;;
-    fm-backend-orca.test.sh)
+    fm-backend-orca.test.sh|fm-backend-orca-smoke.test.sh)
       printf '%s\n' orca
       ;;
     fm-branch-supervision.test.sh|fm-busy-adapter-wiring.test.sh|\

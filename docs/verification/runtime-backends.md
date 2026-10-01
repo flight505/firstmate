@@ -1923,6 +1923,105 @@ xyz
 The raw ESC byte reached the process as Escape, the raw Ctrl-U byte performed the terminal line kill that removed `abc`, and `--interrupt` arrived as Ctrl-C.
 Against live agents, one Escape left a running Claude Code 2.1.286 running with `agentIdentity="claude"`, and one Escape dismissed the Codex 0.158.0 folder-trust dialog through its `esc quit` binding.
 
+### Native agent state
+
+The response shapes below were observed on 2026-10-01 against Orca CLI 1.4.218 (`orca --version`) with app 1.4.217 (`ORCA_APP_VERSION`), from a Claude Code 2.1.286 agent launched in one throwaway terminal.
+`bin/backends/orca.sh` accepts only these shapes for its busy read and its bounded wait.
+
+```sh
+orca agent-context --json
+orca terminal show --terminal <handle> --json
+orca worktree ps --json
+orca terminal wait --terminal <handle> --for tui-idle --timeout-ms <ms> --json
+```
+
+`orca agent-context --json` is not wrapped in the `ok`/`result` envelope the other commands use.
+The fields the capability gate reads:
+
+```text
+schemaVersion=1
+commands[].command="terminal wait"  flags include terminal, for, timeout-ms, json  usage contains "--for exit|tui-idle"
+commands[].command="terminal show"  flags include terminal, json
+commands[].command="worktree ps"    flags include json
+```
+
+`orca terminal show` names the terminal's tab and leaf, and their join is the `paneKey` of that terminal's agent row.
+`ORCA_PANE_KEY` inside the terminal held the same joined value.
+
+```text
+ok=true
+result.terminal.handle=term_<uuid>
+result.terminal.tabId=<uuid>
+result.terminal.leafId=<uuid>
+result.terminal.agentIdentity="claude"      absent on a terminal with no agent
+result.terminal.agentWait=null              {"source":"hook","since":<ms>} while the row is waiting
+```
+
+`orca worktree ps` returns one row per agent under each worktree row:
+
+```text
+ok=true
+result.worktrees[].agents[].paneKey="<tabId>:<leafId>"
+result.worktrees[].agents[].state="working" | "waiting" | "done"
+result.worktrees[].agents[].mainAgent.state="working" | "waiting" | "done"
+result.worktrees[].agents[].stateStartedAt=<ms epoch>
+result.worktrees[].agents[].workingMode="monitoring"     present only on the row described below
+result.totalCount=<n>
+result.truncated=false
+```
+
+The row followed the agent through these states:
+
+| Moment | `state` | `mainAgent.state` | tui-idle wait |
+| --- | --- | --- | --- |
+| Agent launched, sitting at its prompt | `done` | `done` | satisfied at once |
+| Turn in flight | `working` | `working` | times out |
+| Permission dialog showing | `waiting` | `waiting` | satisfied at once |
+| Dialog approved, approved tool still running | `waiting` | `waiting` | times out |
+| Turn ended with a background shell still running | `working`, `workingMode=monitoring` | `done` | satisfied at once |
+| Turn ended, nothing running | `done` | `done` | satisfied at once |
+| Agent exited with `/exit` | no row | no row | times out |
+| Agent killed with `kill -9` mid-turn | no row within 3 seconds | no row | times out |
+| No agent ever started in the terminal | no row | no row | times out |
+
+Orca kept `state=waiting` and `agentWait` set for the whole run of the approved tool, and returned to a fresh state only when that tool finished.
+A long tui-idle wait started during that run returned satisfied 19 seconds later, at the moment the turn ended.
+
+A satisfied `orca terminal wait` exits 0:
+
+```json
+{"ok":true,"result":{"wait":{"handle":"term_<uuid>","condition":"tui-idle","satisfied":true,"status":"running","exitCode":null}}}
+```
+
+A wait that reaches `--timeout-ms` exits 1:
+
+```json
+{"ok":false,"error":{"code":"timeout","message":"timeout"}}
+```
+
+A wait, or a `terminal show`, on a handle that does not exist exits 1 at once:
+
+```json
+{"ok":false,"error":{"code":"terminal_handle_stale","message":"terminal_handle_stale"}}
+```
+
+Orca's bundled CLI guide describes a timed-out wait as an ordinary result carrying `satisfied=false`.
+1.4.218 did not answer that way, so the adapter treats that shape as unrecognized rather than as a clean timeout.
+
+```sh
+tests/fm-backend-orca-smoke.test.sh
+```
+
+That read-only smoke refreshes the capability, envelope, agent-row, pane-key, and missing-terminal facts against the installed Orca and fails naming its version when one drifts.
+The state table needs a live agent and stays a recorded observation.
+
+```text
+ok - orca 1.4.218: the command schema lists the native wait and agent-row commands the adapter uses
+ok - orca 1.4.218: worktree ps answers in the verified envelope and all 6 live agent rows carry the verified fields
+ok - orca 1.4.218: terminal show yields this terminal's pane key, and its native busy state reads 'busy'
+ok - orca 1.4.218: a terminal that does not exist reads unknown, and its tui-idle wait is an unusable read rather than idle
+```
+
 ## cmux
 
 The current compatibility floor is cmux 0.64, and the active live evidence uses 0.64.17 build 97 on macOS aarch64.
